@@ -1,0 +1,292 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import tensorflow_probability as tfp
+tfd = tfp.distributions
+
+# Data generation #
+
+def f(x, sigma):
+    epsilon = np.random.randn(*x.shape) * sigma
+    return 10 * np.sin(2 * np.pi * (x)) + epsilon
+
+train_size = 500
+noise = 1.0
+
+X1 = np.linspace(-0.5, -0.25, 250)[:, np.newaxis]
+X2 = np.linspace(0.25, 0.5, 250)[:, np.newaxis]
+X = np.concatenate([X1, X2])
+y = f(X, sigma=noise)
+
+x_true = np.linspace(-0.5, 0.5, 1000)[:, np.newaxis]
+y_true = f(x_true, sigma=0.0)
+
+plt.scatter(X, y, marker='+', label='Training data')
+plt.plot(x_true, y_true, label='Truth')
+plt.title('Noisy training data and ground truth')
+plt.legend();
+
+# prior function #
+
+from keras import backend as K
+from keras import activations, initializers
+from keras.layers import Layer
+import tensorflow as tf
+
+def mixture_prior_params(sigma_1, sigma_2, pi, return_sigma=False):
+    params = K.variable([sigma_1, sigma_2, pi], name='mixture_prior_params')
+    sigma = np.sqrt(pi * sigma_1 ** 2 + (1 - pi) * sigma_2 ** 2)
+    return params, sigma
+  
+def log_mixture_prior_prob(w):
+    comp_1_dist = tf.distributions.Normal(0.0, prior_params[0])
+    comp_2_dist = tf.distributions.Normal(0.0, prior_params[1])
+    comp_1_weight = prior_params[2]
+    return K.log(comp_1_weight * comp_1_dist.prob(w) + (1 - comp_1_weight) * comp_2_dist.prob(w))
+  
+# Mixture prior parameters shared across DenseVariational layer instances
+prior_params, prior_sigma = mixture_prior_params(sigma_1=1.0, sigma_2=0.1, pi=0.2)
+
+# posterior function #
+
+from tensorflow.keras.layers import Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+  
+batch_size = train_size
+num_batches = train_size / batch_size
+kl_loss_weight = 1.0 / num_batches
+  
+# Specify the surrogate posterior over `keras.layers.Dense` `kernel` and `bias`.
+def  posterior_mean_field(kernel_size, bias_size=0, dtype=None):
+    n = kernel_size + bias_size
+    c = np.log(np.expm1(1.))
+    return tf.keras.Sequential([
+        tfp.layers.VariableLayer(2 * n, dtype=dtype),
+        tfp.layers.DistributionLambda(lambda t: tfd.Independent(
+            tfd.Normal(loc=t[..., :n],
+                       scale=1e-5 + tf.nn.softplus(c + t[..., n:])),
+            reinterpreted_batch_ndims=1)),
+    ])
+
+# Specify the prior over `keras.layers.Dense` `kernel` and `bias`.
+def prior_trainable(kernel_size, bias_size=0, dtype=None):
+    n = kernel_size + bias_size
+    return tf.keras.Sequential([
+        tfp.layers.VariableLayer(n, dtype=dtype),
+        tfp.layers.DistributionLambda(lambda t: tfd.Independent(
+            tfd.Normal(loc=t, scale=1),
+            reinterpreted_batch_ndims=1)),
+    ])
+  
+# Build model.
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(1,)),
+    tfp.layers.DenseVariational(units=50,
+                                make_posterior_fn=posterior_mean_field,
+                                make_prior_fn=prior_trainable,
+                                kl_weight=kl_loss_weight,
+                                activation='relu'),
+    tfp.layers.DenseVariational(units=49,
+                                make_posterior_fn=posterior_mean_field,
+                                make_prior_fn=prior_trainable,
+                                kl_weight=kl_loss_weight,
+                                activation='relu'),
+    tfp.layers.DenseVariational(units=1,
+                                make_posterior_fn=posterior_mean_field,
+                                make_prior_fn=prior_trainable,
+                                kl_weight=kl_loss_weight)
+])
+
+# Train model
+
+from keras import callbacks, optimizers
+
+def neg_log_likelihood(y_true, y_pred, sigma=noise):
+    dist = tfp.distributions.Normal(loc=y_pred, scale=sigma)
+    return K.sum(-dist.log_prob(y_true))
+
+model.compile(loss=neg_log_likelihood, optimizer=tf.keras.optimizers.Adam(lr=0.1), metrics=['mse'])
+model.fit(X, y, batch_size=100, epochs=1500, verbose=0);
+
+# Visualize output
+
+import tqdm
+
+X_test = np.linspace(-1.5, 1.5, 1500).reshape(-1, 1)
+y_pred_list = []
+for i in tqdm.tqdm(range(500)):
+    y_pred = model.predict(X_test)
+    y_pred_list.append(y_pred)
+    
+y_preds = np.concatenate(y_pred_list, axis=1)
+y_mean = np.mean(y_preds, axis=1)
+y_sigma = np.std(y_preds, axis=1)
+  
+plt.plot(X_test, y_mean, 'r-', label='Predictive mean');
+plt.scatter(X, y, marker='+', label='Training data')
+plt.fill_between(X_test.ravel(),
+                 y_mean + 2 * y_sigma,
+                 y_mean - 2 * y_sigma,
+                 alpha=0.5, label='Epistemic uncertainty')
+plt.title('Prediction')
+plt.legend();
+
+## Change variance to 0 randomly
+
+# 1. full variance
+
+# new prior function
+
+def prior2(kernel_size, bias_size, dtype=None):
+    dummy_input = np.array([[103]])
+    if kernel_size == 50:
+      model_prior2 = model.layers[0]._prior(dummy_input)
+    elif kernel_size == 2450:
+      model_prior2 = model.layers[1]._prior(dummy_input)
+    elif kernel_size == 49:
+      model_prior2 = model.layers[2]._prior(dummy_input)
+    
+    prior_model2 = tf.keras.Sequential(
+        [
+            tfp.layers.DistributionLambda(
+                  lambda t: tfd.Independent(
+                  tfd.Normal(loc=model_prior2.mean(), scale=model_prior2.variance()),reinterpreted_batch_ndims=1)
+                )
+            
+        ]
+    )
+    return prior_model2
+    
+# new posterior function
+
+def posterior2(kernel_size, bias_size, dtype=None):
+    print(kernel_size)
+    dummy_input = np.array([[103]])
+    if kernel_size == 50:
+      model_posterior2 = model.layers[0]._posterior(dummy_input)
+    elif kernel_size == 2450:
+      model_posterior2 = model.layers[1]._posterior(dummy_input)
+    elif kernel_size == 49:
+      model_posterior2 = model.layers[2]._posterior(dummy_input)
+    posterior_model2 = tf.keras.Sequential(
+        [
+            tfp.layers.DistributionLambda(
+                  lambda t: tfd.Independent(
+                  tfd.Normal(loc=model_posterior2.mean(), scale=model_posterior2.variance()), reinterpreted_batch_ndims=1))
+            
+        ]
+    )
+    return posterior_model2
+
+# Build model
+
+model2 = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(1,)),
+    tfp.layers.DenseVariational(units=50,
+                                make_posterior_fn=posterior2,
+                                make_prior_fn=prior2,
+                                kl_weight=kl_loss_weight,
+                                activation='relu'),
+    tfp.layers.DenseVariational(units=49,
+                                make_posterior_fn=posterior2,
+                                make_prior_fn=prior2,
+                                kl_weight=kl_loss_weight,
+                                activation='relu'),
+    tfp.layers.DenseVariational(units=1,
+                                make_posterior_fn=posterior2,
+                                make_prior_fn=prior2,
+                                kl_weight=kl_loss_weight)
+])
+
+# Visualize output
+
+import tqdm
+
+X_test2 = np.linspace(-1.5, 1.5, 1500).reshape(-1, 1)
+y_pred_list2 = []
+for i2 in tqdm.tqdm(range(500)):
+    y_pred2 = model2.predict(X_test2)
+    y_pred_list2.append(y_pred2)
+    
+y_preds2 = np.concatenate(y_pred_list2, axis=1)
+y_mean2 = np.mean(y_preds2, axis=1)
+y_sigma2 = np.std(y_preds2, axis=1)
+  
+plt.plot(X_test2, y_mean2, 'r-', label='Predictive mean');
+plt.scatter(X, y, marker='+', label='Training data')
+plt.fill_between(X_test2.ravel(),
+                 y_mean2 + 2 * y_sigma2,
+                 y_mean2 - 2 * y_sigma2,
+                 alpha=0.5, label='Epistemic uncertainty')
+plt.title('Prediction')
+plt.legend();
+
+# 2. 50% variance to 0 ( change posterior )
+
+def posterior_half(kernel_size, bias_size, dtype=None):
+    print(kernel_size)
+    dummy_input = np.array([[103]])
+    if kernel_size == 50:
+      model_posterior2 = model.layers[0]._posterior(dummy_input)
+    elif kernel_size == 2450:
+      model_posterior2 = model.layers[1]._posterior(dummy_input)
+    elif kernel_size == 49:
+      model_posterior2 = model.layers[2]._posterior(dummy_input)
+
+    posterior_variance_full = model_posterior2.variance()
+    zero_one_tensor = tf.cast(tf.random.uniform(shape=(len(model_posterior2.variance().numpy()),), minval=0, maxval=2, dtype=tf.int32),tf.float32)
+    posterior_variance_half = tf.math.multiply(posterior_variance_full, zero_one_tensor)
+
+    posterior_model_half = tf.keras.Sequential(
+        [
+            tfp.layers.DistributionLambda(
+                  lambda t: tfd.Independent(
+                  tfd.Normal(loc=model_posterior2.mean(), scale=posterior_variance_half), reinterpreted_batch_ndims=1))
+            
+        ]
+    )
+    return posterior_model_half
+    
+# Build model.
+
+model_half = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(1,)),
+    tfp.layers.DenseVariational(units=50,
+                                make_posterior_fn=posterior_half,
+                                make_prior_fn=prior2,
+                                kl_weight=kl_loss_weight,
+                                activation='relu'),
+    tfp.layers.DenseVariational(units=49,
+                                make_posterior_fn=posterior_half,
+                                make_prior_fn=prior2,
+                                kl_weight=kl_loss_weight,
+                                activation='relu'),
+    tfp.layers.DenseVariational(units=1,
+                                make_posterior_fn=posterior_half,
+                                make_prior_fn=prior2,
+                                kl_weight=kl_loss_weight)
+])
+
+# Visualize data
+
+import tqdm
+
+X_test2 = np.linspace(-1.5, 1.5, 1500).reshape(-1, 1)
+y_pred_list2 = []
+for i2 in tqdm.tqdm(range(500)):
+    y_pred2 = model_half.predict(X_test2)
+    y_pred_list2.append(y_pred2)
+    
+y_preds2 = np.concatenate(y_pred_list2, axis=1)
+y_mean2 = np.mean(y_preds2, axis=1)
+y_sigma2 = np.std(y_preds2, axis=1)
+  
+plt.plot(X_test2, y_mean2, 'r-', label='Predictive mean');
+plt.scatter(X, y, marker='+', label='Training data')
+plt.fill_between(X_test2.ravel(),
+                 y_mean2 + 2 * y_sigma2,
+                 y_mean2 - 2 * y_sigma2,
+                 alpha=0.5, label='Epistemic uncertainty')
+plt.title('Prediction')
+plt.legend();
